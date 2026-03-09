@@ -5,7 +5,7 @@
 
 **Swin-iFold** 是一种专为高维时间序列预测设计的创新架构。它将一维（1D）太阳能辐照数据重新构想为二维（2D）时空网格（即“折叠”机制），从而利用 **Swin Transformer** 的分层窗口注意力机制，精准捕捉太阳能波动的周期性物理规律。
 
-![Swin-iFold 架构图](architecture.png)
+![Swin-iFold 架构图](./swinifold.png)
 
 ## 🏆 $8 \times 12$ 拓扑结构的突破
 经过对多种拓扑结构（$4 \times 24$、$6 \times 16$ 以及 $16 \times 6$）的详尽测试，**$8 \times 12$ 配置**脱颖而出，成为 Solar AL 数据集的“黄金比例”。
