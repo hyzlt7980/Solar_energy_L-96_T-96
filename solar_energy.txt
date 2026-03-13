@@ -1,5 +1,5 @@
 # ======================================================================
-# Swin-iFold V7 [Solar_txt 2x A100] 
+# Swin-iFold V7 [Solar_txt 4x 4090] 
 # 拓扑实验版：H=8, W=12 (强化局部 2小时 颗粒度)
 # ======================================================================
 import os, time, torch
@@ -16,7 +16,7 @@ from sklearn.preprocessing import StandardScaler
 from timm.models.swin_transformer import SwinTransformerBlock
 from timm.layers import Mlp
 
-# --- A100 极致性能配置 ---
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
