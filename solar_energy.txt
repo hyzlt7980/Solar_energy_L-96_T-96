@@ -300,10 +300,9 @@ E30 | Time: 52.8s | T-Loss: 0.0441 | Val MSE: 0.147357
 🏆 终测环节...
 📊 【8x12 实验开奖】 TEST MSE: 0.163664
 
-
-
 import os
 import time
+import random
 from pathlib import Path
 
 import numpy as np
@@ -334,7 +333,7 @@ except ImportError:
 
 
 # =========================================================
-# 0. 4x4090-friendly runtime settings
+# 0. Runtime
 # =========================================================
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -345,8 +344,15 @@ except Exception:
     pass
 
 
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 # =========================================================
-# 1. RevIN (safe)
+# 1. RevIN
 # =========================================================
 class RevIN(nn.Module):
     def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
@@ -363,11 +369,10 @@ class RevIN(nn.Module):
     def forward(self, x: torch.Tensor, mode: str) -> torch.Tensor:
         # x: [B, L, N]
         if mode == "norm":
-            # 每个样本、每个变量，仅沿时间维归一化
-            self.mean = x.mean(dim=1, keepdim=True).detach()   # [B,1,N]
+            self.mean = x.mean(dim=1, keepdim=True).detach()  # [B,1,N]
             self.stdev = torch.sqrt(
                 x.var(dim=1, keepdim=True, unbiased=False) + self.eps
-            ).detach()                                         # [B,1,N]
+            ).detach()  # [B,1,N]
             x = (x - self.mean) / self.stdev
             if self.affine:
                 x = x * self.affine_weight + self.affine_bias
@@ -382,7 +387,7 @@ class RevIN(nn.Module):
 
 
 # =========================================================
-# 2. DAE block
+# 2. DAE Block
 # =========================================================
 class DenoisingDisruptionBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int = 8):
@@ -395,7 +400,7 @@ class DenoisingDisruptionBlock(nn.Module):
         self.denoise_proj = nn.Linear(dim, dim)
 
     def forward(self, x_noisy: torch.Tensor, x_clean_target: torch.Tensor | None = None):
-        # x_noisy: [B*N, L, C]
+        # x_noisy: [B, L, C]
         n_x = self.norm1(x_noisy)
         attn_out, _ = self.attn(n_x, n_x, n_x, need_weights=False)
         x_p = x_noisy + attn_out
@@ -412,21 +417,29 @@ class DenoisingDisruptionBlock(nn.Module):
 
 
 # =========================================================
-# 3. Main model
-#    第二阶段由 full attention 改成 Swin attention
+# 3. Main Model: Two DAE
 # =========================================================
-class SwinIFoldV7NoDayMask4090(nn.Module):
-    def __init__(self, num_vars: int = 137, embed_dim: int = 128, noise_level: float = 0.025):
+class SwinIFoldV7NoDayMaskL2SwinTwoDAE(nn.Module):
+    def __init__(
+        self,
+        num_vars: int = 137,
+        embed_dim: int = 128,
+        noise_level: float = 0.025,
+        pred_len: int = 96,
+    ):
         super().__init__()
-        self.H, self.W = 8, 12   # seq_len 必须 = 96
-        self.revin = RevIN(num_vars)
-        self.patch_embed = nn.Linear(1, embed_dim)
+        self.H, self.W = 8, 12  # seq_len must be 96
+        self.l2_H, self.l2_W = 4, 6
+        self.pred_len = pred_len
         self.noise_level = noise_level
 
-        # Stage 1: 8x12 上的两层 Swin
+        self.revin = RevIN(num_vars)
+        self.patch_embed = nn.Linear(1, embed_dim)
+
+        # ---------------- Stage 1: 8x12 ----------------
         self.l1_swin1 = SwinTransformerBlock(
             dim=embed_dim,
-            input_resolution=(8, 12),
+            input_resolution=(self.H, self.W),
             num_heads=8,
             window_size=4,
             shift_size=0,
@@ -435,22 +448,20 @@ class SwinIFoldV7NoDayMask4090(nn.Module):
         )
         self.l1_swin2 = SwinTransformerBlock(
             dim=embed_dim,
-            input_resolution=(8, 12),
+            input_resolution=(self.H, self.W),
             num_heads=8,
             window_size=4,
             shift_size=2,
             proj_drop=0.02,
             attn_drop=0.02,
         )
+        self.dae_block1 = DenoisingDisruptionBlock(embed_dim, num_heads=8)
 
-        self.dae_block = DenoisingDisruptionBlock(embed_dim, num_heads=8)
-
-        # 下采样: 8x12 -> 4x6, 通道 128 -> 256
+        # ---------------- Downsample ----------------
         self.reduction = nn.Conv2d(embed_dim, embed_dim * 2, kernel_size=2, stride=2)
         self.norm = nn.LayerNorm(embed_dim * 2)
 
-        # Stage 2: 4x6 上的 Swin，而不是原来的 full attention
-        self.l2_H, self.l2_W = 4, 6
+        # ---------------- Stage 2: 4x6 ----------------
         self.l2_swins = nn.ModuleList([
             SwinTransformerBlock(
                 dim=embed_dim * 2,
@@ -471,8 +482,9 @@ class SwinIFoldV7NoDayMask4090(nn.Module):
                 attn_drop=0.05,
             ),
         ])
+        self.dae_block2 = DenoisingDisruptionBlock(embed_dim * 2, num_heads=8)
 
-        # 变量间 attention 保留
+        # ---------------- Variable Attention ----------------
         self.variable_attention = nn.TransformerEncoderLayer(
             d_model=embed_dim * 2,
             nhead=8,
@@ -482,35 +494,36 @@ class SwinIFoldV7NoDayMask4090(nn.Module):
             dropout=0.05,
         )
 
-        self.head = nn.Linear(embed_dim * 2, 96)
+        self.head = nn.Linear(embed_dim * 2, pred_len)
 
-    def inject_mixed_noise(self, x: torch.Tensor) -> torch.Tensor:
+    def inject_mixed_noise_2d(self, x: torch.Tensor, noise_scale: float = 1.0) -> torch.Tensor:
         """
-        x: [B*N, H, W, C]
+        x: [B, H, W, C]
         """
+        level = self.noise_level * noise_scale
         x_noisy = x.clone()
         rand_probs = torch.rand_like(x)
 
-        # Gaussian noise
-        gauss_mask = rand_probs < (self.noise_level * 0.2)
+        # Gaussian
+        gauss_mask = rand_probs < (level * 0.2)
         x_noisy = torch.where(
             gauss_mask,
-            x_noisy + torch.randn_like(x) * self.noise_level,
+            x_noisy + torch.randn_like(x) * level,
             x_noisy,
         )
 
-        # Pulse noise: 每个样本自己的 max/min，避免跨样本污染
-        pulse_mask = (rand_probs >= (self.noise_level * 0.2)) & (rand_probs < (self.noise_level * 0.6))
-        x_max = x.amax(dim=(1, 2), keepdim=True)  # [B*N,1,1,C]
+        # Pulse
+        pulse_mask = (rand_probs >= (level * 0.2)) & (rand_probs < (level * 0.6))
+        x_max = x.amax(dim=(1, 2), keepdim=True)
         x_min = x.amin(dim=(1, 2), keepdim=True)
         pulse_values = torch.where(torch.rand_like(x) > 0.5, x_max, x_min)
         x_noisy = torch.where(pulse_mask, pulse_values, x_noisy)
 
-        # Drift noise
-        drift_mask = (rand_probs >= (self.noise_level * 0.6)) & (rand_probs < self.noise_level)
+        # Drift
+        drift_mask = (rand_probs >= (level * 0.6)) & (rand_probs < level)
         x_noisy = torch.where(
             drift_mask,
-            x_noisy * (1.0 + torch.randn_like(x) * self.noise_level),
+            x_noisy * (1.0 + torch.randn_like(x) * level),
             x_noisy,
         )
         return x_noisy
@@ -520,57 +533,58 @@ class SwinIFoldV7NoDayMask4090(nn.Module):
         bsz, seq_len, nvars = x.shape
         assert seq_len == self.H * self.W, f"Expected seq_len={self.H * self.W}, got {seq_len}"
 
-        # 1) RevIN norm
+        # ==================================================
+        # Stage 0: RevIN + Patch Embedding
+        # ==================================================
         x = self.revin(x, "norm")
-
-        # 2) patch embedding -> [B*N, 8, 12, 128]
         x_emb = self.patch_embed(
             x.permute(0, 2, 1).reshape(bsz * nvars, seq_len, 1)
-        )
-        x_emb = x_emb.view(bsz * nvars, self.H, self.W, -1)
+        ).view(bsz * nvars, self.H, self.W, -1)
 
-        # 3) Stage 1 Swin
+        # ==================================================
+        # Stage 1: Swin -> Gaussian Noise -> Swin -> Mixed Noise -> DAE1
+        # ==================================================
         x_emb = self.l1_swin1(x_emb)
 
-        # 4) Gaussian noise after Swin1
         if self.training:
             x_emb = x_emb + torch.randn_like(x_emb) * self.noise_level * 0.5
 
-        # 5) Swin2 -> clean target
-        x_clean_target = self.l1_swin2(x_emb)
+        x1_clean_target = self.l1_swin2(x_emb)
+        x1_noisy = self.inject_mixed_noise_2d(x1_clean_target, noise_scale=1.0) if self.training else x1_clean_target
 
-        # 6) mixed noise injection
-        x_noisy = self.inject_mixed_noise(x_clean_target) if self.training else x_clean_target
-
-        # 7) DAE
-        x_flat, d_loss = self.dae_block(
-            x_noisy.view(bsz * nvars, seq_len, -1),
-            x_clean_target.view(bsz * nvars, seq_len, -1),
+        x1_flat, d_loss1 = self.dae_block1(
+            x1_noisy.view(bsz * nvars, seq_len, -1),
+            x1_clean_target.view(bsz * nvars, seq_len, -1),
         )
+        x_emb = x1_flat.view(bsz * nvars, self.H, self.W, -1)
 
-        # 8) reshape back -> [B*N, 8, 12, 128]
-        x_emb = x_flat.view(bsz * nvars, self.H, self.W, -1)
-
-        # 9) reduction -> [B*N, 24, 256] -> norm -> [B*N, 4, 6, 256]
+        # ==================================================
+        # Stage 2: Downsample -> l2_swins -> Mixed Noise -> DAE2
+        # ==================================================
         x_emb = self.reduction(x_emb.permute(0, 3, 1, 2)).flatten(2).transpose(1, 2)
         x_emb = self.norm(x_emb).view(bsz * nvars, self.l2_H, self.l2_W, -1)
 
-        # 10) Stage 2 Swin
         for blk in self.l2_swins:
             x_emb = blk(x_emb)
 
-        # 11) spatial pooling -> [B, N, 256]
-        feat = x_emb.mean(dim=(1, 2)).view(bsz, nvars, -1)
+        x2_clean_target = x_emb
+        x2_noisy = self.inject_mixed_noise_2d(x2_clean_target, noise_scale=0.6) if self.training else x2_clean_target
 
-        # 12) variable attention
+        x2_flat, d_loss2 = self.dae_block2(
+            x2_noisy.view(bsz * nvars, self.l2_H * self.l2_W, -1),
+            x2_clean_target.view(bsz * nvars, self.l2_H * self.l2_W, -1),
+        )
+        x_emb = x2_flat.view(bsz * nvars, self.l2_H, self.l2_W, -1)
+
+        # ==================================================
+        # Head
+        # ==================================================
+        feat = x_emb.mean(dim=(1, 2)).view(bsz, nvars, -1)
         feat = self.variable_attention(feat)
 
-        # 13) head -> [B, 96, N]
         out = self.head(feat).permute(0, 2, 1)
-
-        # 14) RevIN denorm
         out = self.revin(out, "denorm")
-        return out, d_loss
+        return out, d_loss1, d_loss2
 
 
 # =========================================================
@@ -611,6 +625,52 @@ def safe_torch_load(path: str | Path, map_location):
         return torch.load(path, map_location=map_location, weights_only=True)
     except TypeError:
         return torch.load(path, map_location=map_location)
+
+
+def checkpoint_payload(
+    model: DDP,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    scaler: GradScaler,
+    epoch: int,
+    best_val_mse: float,
+):
+    return {
+        "epoch": epoch,
+        "model_state_dict": model.module.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "best_val_mse": best_val_mse,
+    }
+
+
+def load_checkpoint_for_resume(
+    ckpt_obj,
+    model: DDP,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    scaler: GradScaler,
+):
+    start_epoch = 0
+    best_val_mse = float("inf")
+
+    # Backward compatible: old checkpoint may be pure state_dict
+    if isinstance(ckpt_obj, dict) and "model_state_dict" in ckpt_obj:
+        model.module.load_state_dict(ckpt_obj["model_state_dict"])
+        if "optimizer_state_dict" in ckpt_obj:
+            optimizer.load_state_dict(ckpt_obj["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt_obj:
+            scheduler.load_state_dict(ckpt_obj["scheduler_state_dict"])
+        if "scaler_state_dict" in ckpt_obj and ckpt_obj["scaler_state_dict"] is not None:
+            scaler.load_state_dict(ckpt_obj["scaler_state_dict"])
+
+        start_epoch = int(ckpt_obj.get("epoch", -1)) + 1
+        best_val_mse = float(ckpt_obj.get("best_val_mse", float("inf")))
+    else:
+        model.module.load_state_dict(ckpt_obj)
+
+    return start_epoch, best_val_mse
 
 
 def resolve_solar_txt_path() -> Path:
@@ -658,8 +718,24 @@ def build_or_load_cache(txt_path: Path, cache_path: Path, rank: int) -> np.ndarr
     return np.load(cache_path, mmap_mode=None)
 
 
+def build_loader(dataset, batch_size, sampler=None, shuffle=False, num_workers=0):
+    kwargs = dict(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 4
+    return DataLoader(**kwargs)
+
+
 # =========================================================
-# 5. Train / eval
+# 5. Train / Eval
 # =========================================================
 def evaluate_rank0(model_module: nn.Module, loader: DataLoader, device: torch.device, amp_dtype: torch.dtype) -> float:
     model_module.eval()
@@ -671,7 +747,7 @@ def evaluate_rank0(model_module: nn.Module, loader: DataLoader, device: torch.de
             bx = bx.to(device, non_blocking=True)
             by = by.to(device, non_blocking=True)
             with (autocast("cuda", dtype=amp_dtype) if AMP_NEW else autocast(dtype=amp_dtype)):
-                pred, _ = model_module(bx)
+                pred, _, _ = model_module(bx)
             batch_mse = F.mse_loss(pred, by, reduction="mean").item()
             mse_sum += batch_mse * bx.size(0)
             sample_cnt += bx.size(0)
@@ -680,6 +756,9 @@ def evaluate_rank0(model_module: nn.Module, loader: DataLoader, device: torch.de
 
 
 def main():
+    seed = int(os.environ.get("SEED", 42))
+    set_seed(seed)
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     dist.init_process_group("nccl")
     torch.cuda.set_device(local_rank)
@@ -709,44 +788,37 @@ def main():
     cpu_count = os.cpu_count() or 8
     num_workers = int(os.environ.get("NUM_WORKERS", min(6, max(2, cpu_count // max(world_size, 1)))))
 
-    train_loader = DataLoader(
+    train_loader = build_loader(
         train_ds,
         batch_size=local_bs,
         sampler=train_sampler,
         num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=(num_workers > 0),
-        prefetch_factor=4 if num_workers > 0 else None,
-        drop_last=False,
     )
 
     if local_rank == 0:
         eval_workers = max(2, num_workers // 2)
-        val_loader = DataLoader(
+        val_loader = build_loader(
             val_ds,
             batch_size=local_bs,
             shuffle=False,
             num_workers=eval_workers,
-            pin_memory=True,
-            persistent_workers=(eval_workers > 0),
-            prefetch_factor=4 if eval_workers > 0 else None,
-            drop_last=False,
         )
-        test_loader = DataLoader(
+        test_loader = build_loader(
             test_ds,
             batch_size=local_bs,
             shuffle=False,
             num_workers=eval_workers,
-            pin_memory=True,
-            persistent_workers=(eval_workers > 0),
-            prefetch_factor=4 if eval_workers > 0 else None,
-            drop_last=False,
         )
     else:
         val_loader = None
         test_loader = None
 
-    model = SwinIFoldV7NoDayMask4090(num_vars=137, embed_dim=128).to(device)
+    model = SwinIFoldV7NoDayMaskL2SwinTwoDAE(
+        num_vars=137,
+        embed_dim=128,
+        noise_level=0.025,
+        pred_len=pred_len,
+    ).to(device)
 
     compile_enabled = os.environ.get("USE_TORCH_COMPILE", "0") == "1"
     if compile_enabled and hasattr(torch, "compile"):
@@ -771,26 +843,60 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.HuberLoss(delta=0.5)
 
-    save_path = Path(os.environ.get("CKPT_PATH", "best_v7_no_daymask_l2swin_4x4090.pth"))
+    dae1_weight = float(os.environ.get("DAE1_WEIGHT", 0.1))
+    dae2_weight = float(os.environ.get("DAE2_WEIGHT", 0.05))
+
+    best_ckpt_path = Path(os.environ.get("CKPT_PATH", "best_v7_no_daymask_l2swin_2dae_4x4090.pth"))
+    latest_ckpt_path = Path(
+        os.environ.get(
+            "LATEST_CKPT_PATH",
+            str(best_ckpt_path.with_name(best_ckpt_path.stem + "_latest.pth"))
+        )
+    )
+    resume_path = Path(os.environ.get("RESUME_PATH", str(latest_ckpt_path)))
+    auto_resume = os.environ.get("AUTO_RESUME", "1") == "1"
+
     best_val_mse = float("inf")
+    start_epoch = 0
+
+    if auto_resume and resume_path.exists():
+        ckpt_obj = safe_torch_load(resume_path, map_location=device)
+        start_epoch, best_val_mse = load_checkpoint_for_resume(
+            ckpt_obj, model, optimizer, scheduler, scaler
+        )
+        if local_rank == 0:
+            print(f"🔁 Resumed from: {resume_path}")
+            print(f"   start_epoch  : {start_epoch}")
+            print(f"   best_val_mse : {best_val_mse:.6f}")
+    elif local_rank == 0:
+        print(f"🆕 No resume checkpoint found at: {resume_path}, start from scratch.")
+
+    dist.barrier()
 
     if local_rank == 0:
-        print("=" * 72)
-        print("🌟 V7_NO_DAYMASK_L2SWIN_4x4090")
-        print(f"Dataset : {txt_path}")
-        print(f"Cache   : {cache_path}")
-        print(f"GPUs    : {world_size}")
-        print(f"BS      : global={global_bs}, local={local_bs}")
-        print(f"Workers : {num_workers}")
-        print(f"AMP     : {amp_dtype}")
-        print(f"Compile : {compile_enabled}")
-        print("=" * 72)
+        print("=" * 76)
+        print("🌟 V7_NO_DAYMASK_L2SWIN_2DAE_4x4090")
+        print(f"Dataset     : {txt_path}")
+        print(f"Cache       : {cache_path}")
+        print(f"GPUs        : {world_size}")
+        print(f"BS          : global={global_bs}, local={local_bs}")
+        print(f"Workers     : {num_workers}")
+        print(f"AMP         : {amp_dtype}")
+        print(f"Compile     : {compile_enabled}")
+        print(f"Seed        : {seed}")
+        print(f"DAE Weights : dae1={dae1_weight}, dae2={dae2_weight}")
+        print(f"Best CKPT   : {best_ckpt_path}")
+        print(f"Latest CKPT : {latest_ckpt_path}")
+        print(f"Resume Path : {resume_path}")
+        print("=" * 76)
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         train_sampler.set_epoch(epoch)
         model.train()
+
         epoch_m_loss = 0.0
-        epoch_d_loss = 0.0
+        epoch_d1_loss = 0.0
+        epoch_d2_loss = 0.0
         t0 = time.time()
 
         for bx, by in train_loader:
@@ -800,39 +906,71 @@ def main():
             optimizer.zero_grad(set_to_none=True)
 
             with (autocast("cuda", dtype=amp_dtype) if AMP_NEW else autocast(dtype=amp_dtype)):
-                pred, d_loss = model(bx)
-                d_loss_mean = d_loss.mean() if d_loss.ndim > 0 else d_loss
+                pred, d_loss1, d_loss2 = model(bx)
+                d_loss1_mean = d_loss1.mean() if d_loss1.ndim > 0 else d_loss1
+                d_loss2_mean = d_loss2.mean() if d_loss2.ndim > 0 else d_loss2
                 m_loss = criterion(pred, by)
-                loss = m_loss + 0.1 * d_loss_mean
+                loss = m_loss + dae1_weight * d_loss1_mean + dae2_weight * d_loss2_mean
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
-            epoch_m_loss += m_loss.item()
-            epoch_d_loss += float(d_loss_mean.item())
+            epoch_m_loss += float(m_loss.item())
+            epoch_d1_loss += float(d_loss1_mean.item())
+            epoch_d2_loss += float(d_loss2_mean.item())
+
+        is_best = False
+        avg_val = None
 
         if local_rank == 0:
             avg_val = evaluate_rank0(model.module, val_loader, device, amp_dtype)
-            status = "🔥 New Best" if avg_val < best_val_mse else ""
+            is_best = avg_val < best_val_mse
+            status = "🔥 New Best" if is_best else ""
             print(
                 f"E{epoch + 1:02d} | Time {time.time() - t0:.1f}s | "
                 f"Train {epoch_m_loss / len(train_loader):.4f} | "
-                f"DAE {epoch_d_loss / len(train_loader):.4f} | "
+                f"DAE1 {epoch_d1_loss / len(train_loader):.4f} | "
+                f"DAE2 {epoch_d2_loss / len(train_loader):.4f} | "
                 f"Val {avg_val:.6f} {status}"
             )
-            if avg_val < best_val_mse:
+            if is_best:
                 best_val_mse = avg_val
-                torch.save(model.module.state_dict(), save_path)
 
         scheduler.step()
+
+        if local_rank == 0:
+            latest_payload = checkpoint_payload(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=epoch,
+                best_val_mse=best_val_mse,
+            )
+            torch.save(latest_payload, latest_ckpt_path)
+
+            if is_best:
+                torch.save(latest_payload, best_ckpt_path)
+
         dist.barrier()
 
     if local_rank == 0:
-        print("\n🏆 Final test...")
-        state_dict = safe_torch_load(save_path, map_location=device)
-        model.module.load_state_dict(state_dict)
+        print("\n🏆 Final evaluation...")
+
+        eval_ckpt_path = best_ckpt_path if best_ckpt_path.exists() else latest_ckpt_path
+        ckpt_obj = safe_torch_load(eval_ckpt_path, map_location=device)
+
+        if isinstance(ckpt_obj, dict) and "model_state_dict" in ckpt_obj:
+            model.module.load_state_dict(ckpt_obj["model_state_dict"])
+        else:
+            model.module.load_state_dict(ckpt_obj)
+
+        best_val_check = evaluate_rank0(model.module, val_loader, device, amp_dtype)
         final_test_mse = evaluate_rank0(model.module, test_loader, device, amp_dtype)
+
+        print(f"📌 Eval CKPT         : {eval_ckpt_path}")
+        print(f"📌 Reloaded BEST Val MSE: {best_val_check:.6f}")
         print(f"📊 TEST MSE: {final_test_mse:.6f}")
 
     dist.barrier()
@@ -849,55 +987,63 @@ EPOCHS=30 \
 LR=1e-3 \
 WEIGHT_DECAY=1e-5 \
 NUM_WORKERS=6 \
-CKPT_PATH=best_v7_no_daymask_l2swin_4x4090.pth \
-SOLAR_CACHE_PATH=solar_norm_ready_v7_4090_l2swin.npy \
-torchrun --nproc_per_node=4 --master_port=29501 test2.py
-[2026-03-23 04:29:29,186] torch.distributed.run: [WARNING] 
-[2026-03-23 04:29:29,186] torch.distributed.run: [WARNING] *****************************************
-[2026-03-23 04:29:29,186] torch.distributed.run: [WARNING] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
-[2026-03-23 04:29:29,186] torch.distributed.run: [WARNING] *****************************************
-⏳ [Rank 0] Building normalized cache from: /root/.cache/kagglehub/datasets/tylerfarnan/itransformer-datasets/versions/1/iTransformer_datasets/Solar/solar_AL.txt
-✅ [Rank 0] Saved cache: solar_norm_ready_v7_4090_l2swin.npy
-========================================================================
-🌟 V7_NO_DAYMASK_L2SWIN_4x4090
-Dataset : /root/.cache/kagglehub/datasets/tylerfarnan/itransformer-datasets/versions/1/iTransformer_datasets/Solar/solar_AL.txt
-Cache   : solar_norm_ready_v7_4090_l2swin.npy
-GPUs    : 4
-BS      : global=256, local=64
-Workers : 6
-AMP     : torch.float16
-Compile : False
-========================================================================
-E01 | Time 55.9s | Train 0.1074 | DAE 0.1818 | Val 0.188946 🔥 New Best
-E02 | Time 53.0s | Train 0.0750 | DAE 0.0329 | Val 0.193813 
-E03 | Time 53.0s | Train 0.0701 | DAE 0.0267 | Val 0.162812 🔥 New Best
-E04 | Time 53.0s | Train 0.0671 | DAE 0.0249 | Val 0.167584 
-E05 | Time 53.0s | Train 0.0642 | DAE 0.0232 | Val 0.165998 
-E06 | Time 53.0s | Train 0.0627 | DAE 0.0229 | Val 0.161590 🔥 New Best
-E07 | Time 53.0s | Train 0.0619 | DAE 0.0223 | Val 0.164605 
-E08 | Time 53.0s | Train 0.0611 | DAE 0.0230 | Val 0.157013 🔥 New Best
-E09 | Time 53.0s | Train 0.0594 | DAE 0.0229 | Val 0.160956 
-E10 | Time 53.0s | Train 0.0587 | DAE 0.0217 | Val 0.152169 🔥 New Best
-E11 | Time 53.0s | Train 0.0575 | DAE 0.0219 | Val 0.155766 
-E12 | Time 53.0s | Train 0.0564 | DAE 0.0231 | Val 0.157335 
-E13 | Time 53.0s | Train 0.0550 | DAE 0.0236 | Val 0.154739 
-E14 | Time 52.9s | Train 0.0539 | DAE 0.0241 | Val 0.153679 
-E15 | Time 53.0s | Train 0.0521 | DAE 0.0233 | Val 0.152481 
-E16 | Time 53.0s | Train 0.0508 | DAE 0.0232 | Val 0.154436 
-E17 | Time 53.0s | Train 0.0502 | DAE 0.0235 | Val 0.149097 🔥 New Best
-E18 | Time 53.0s | Train 0.0497 | DAE 0.0240 | Val 0.145328 🔥 New Best
-E19 | Time 53.0s | Train 0.0483 | DAE 0.0239 | Val 0.149782 
-E20 | Time 53.0s | Train 0.0467 | DAE 0.0243 | Val 0.147555 
-E21 | Time 53.0s | Train 0.0459 | DAE 0.0239 | Val 0.152168 
-E22 | Time 53.0s | Train 0.0460 | DAE 0.0245 | Val 0.149183 
-E23 | Time 53.0s | Train 0.0448 | DAE 0.0244 | Val 0.139340 🔥 New Best
-E24 | Time 53.0s | Train 0.0442 | DAE 0.0244 | Val 0.143804 
-E25 | Time 53.0s | Train 0.0435 | DAE 0.0242 | Val 0.140288 
-E26 | Time 53.0s | Train 0.0433 | DAE 0.0242 | Val 0.139840 
-E27 | Time 53.0s | Train 0.0428 | DAE 0.0242 | Val 0.145057 
-E28 | Time 53.0s | Train 0.0428 | DAE 0.0242 | Val 0.142173 
-E29 | Time 53.0s | Train 0.0424 | DAE 0.0242 | Val 0.142484 
-E30 | Time 53.0s | Train 0.0424 | DAE 0.0242 | Val 0.143424 
+CKPT_PATH=best_v7_no_daymask_l2swin_2dae_4x4090.pth \
+LATEST_CKPT_PATH=latest_v7_no_daymask_l2swin_2dae_4x4090.pth \
+AUTO_RESUME=1 \
+torchrun --nproc_per_node=4 test3.py
+[2026-03-23 05:39:56,707] torch.distributed.run: [WARNING] 
+[2026-03-23 05:39:56,707] torch.distributed.run: [WARNING] *****************************************
+[2026-03-23 05:39:56,707] torch.distributed.run: [WARNING] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+[2026-03-23 05:39:56,707] torch.distributed.run: [WARNING] *****************************************
+⚡ [Rank 0] Using existing cache: solar_norm_ready_v7_4090_l2swin.npy
+🆕 No resume checkpoint found at: latest_v7_no_daymask_l2swin_2dae_4x4090.pth, start from scratch.
+============================================================================
+🌟 V7_NO_DAYMASK_L2SWIN_2DAE_4x4090
+Dataset     : /root/.cache/kagglehub/datasets/tylerfarnan/itransformer-datasets/versions/1/iTransformer_datasets/Solar/solar_AL.txt
+Cache       : solar_norm_ready_v7_4090_l2swin.npy
+GPUs        : 4
+BS          : global=256, local=64
+Workers     : 6
+AMP         : torch.float16
+Compile     : False
+Seed        : 42
+DAE Weights : dae1=0.1, dae2=0.05
+Best CKPT   : best_v7_no_daymask_l2swin_2dae_4x4090.pth
+Latest CKPT : latest_v7_no_daymask_l2swin_2dae_4x4090.pth
+Resume Path : latest_v7_no_daymask_l2swin_2dae_4x4090.pth
+============================================================================
+E01 | Time 65.5s | Train 0.1102 | DAE1 0.2004 | DAE2 0.3414 | Val 0.191586 🔥 New Best
+E02 | Time 62.5s | Train 0.0747 | DAE1 0.0274 | DAE2 0.0773 | Val 0.197110 
+E03 | Time 62.5s | Train 0.0694 | DAE1 0.0225 | DAE2 0.0641 | Val 0.161403 🔥 New Best
+E04 | Time 62.5s | Train 0.0661 | DAE1 0.0206 | DAE2 0.0598 | Val 0.158607 🔥 New Best
+E05 | Time 62.6s | Train 0.0635 | DAE1 0.0206 | DAE2 0.0570 | Val 0.167622 
+E06 | Time 62.6s | Train 0.0618 | DAE1 0.0216 | DAE2 0.0563 | Val 0.156077 🔥 New Best
+E07 | Time 62.5s | Train 0.0616 | DAE1 0.0221 | DAE2 0.0555 | Val 0.154424 🔥 New Best
+E08 | Time 62.6s | Train 0.0602 | DAE1 0.0204 | DAE2 0.0533 | Val 0.156012 
+E09 | Time 62.6s | Train 0.0585 | DAE1 0.0203 | DAE2 0.0552 | Val 0.154218 🔥 New Best
+E10 | Time 62.6s | Train 0.0576 | DAE1 0.0215 | DAE2 0.0567 | Val 0.153138 🔥 New Best
+E11 | Time 62.5s | Train 0.0561 | DAE1 0.0219 | DAE2 0.0584 | Val 0.155227 
+E12 | Time 62.6s | Train 0.0549 | DAE1 0.0219 | DAE2 0.0604 | Val 0.150221 🔥 New Best
+E13 | Time 62.5s | Train 0.0531 | DAE1 0.0213 | DAE2 0.0613 | Val 0.152970 
+E14 | Time 62.5s | Train 0.0520 | DAE1 0.0205 | DAE2 0.0618 | Val 0.150793 
+E15 | Time 62.5s | Train 0.0502 | DAE1 0.0216 | DAE2 0.0638 | Val 0.147073 🔥 New Best
+E16 | Time 62.5s | Train 0.0493 | DAE1 0.0208 | DAE2 0.0657 | Val 0.152488 
+E17 | Time 62.6s | Train 0.0483 | DAE1 0.0214 | DAE2 0.0673 | Val 0.146619 🔥 New Best
+E18 | Time 62.5s | Train 0.0477 | DAE1 0.0221 | DAE2 0.0687 | Val 0.152134 
+E19 | Time 62.6s | Train 0.0466 | DAE1 0.0223 | DAE2 0.0702 | Val 0.140584 🔥 New Best
+E20 | Time 62.6s | Train 0.0455 | DAE1 0.0232 | DAE2 0.0713 | Val 0.143636 
+E21 | Time 62.5s | Train 0.0445 | DAE1 0.0220 | DAE2 0.0722 | Val 0.142829 
+E22 | Time 62.5s | Train 0.0445 | DAE1 0.0221 | DAE2 0.0731 | Val 0.145644 
+E23 | Time 62.5s | Train 0.0435 | DAE1 0.0219 | DAE2 0.0742 | Val 0.142669 
+E24 | Time 62.6s | Train 0.0432 | DAE1 0.0222 | DAE2 0.0744 | Val 0.140224 🔥 New Best
+E25 | Time 62.6s | Train 0.0424 | DAE1 0.0221 | DAE2 0.0747 | Val 0.141248 
+E26 | Time 62.5s | Train 0.0423 | DAE1 0.0223 | DAE2 0.0753 | Val 0.138023 🔥 New Best
+E27 | Time 62.6s | Train 0.0421 | DAE1 0.0222 | DAE2 0.0759 | Val 0.143578 
+E28 | Time 62.5s | Train 0.0418 | DAE1 0.0223 | DAE2 0.0762 | Val 0.142304 
+E29 | Time 62.6s | Train 0.0414 | DAE1 0.0223 | DAE2 0.0763 | Val 0.143531 
+E30 | Time 62.5s | Train 0.0415 | DAE1 0.0223 | DAE2 0.0765 | Val 0.142742 
 
-🏆 Final test...
-📊 TEST MSE: 0.194198
+🏆 Final evaluation...
+📌 Eval CKPT         : best_v7_no_daymask_l2swin_2dae_4x4090.pth
+📌 Reloaded BEST Val MSE: 0.138023
+📊 TEST MSE: 0.179316
