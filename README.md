@@ -14,8 +14,8 @@
 | :--- | :--- | :--- |
 | iTransformer（ICLR2024） | 0.203 | ❌ 已超越 |
 | TimeMixer(ICLR2024) | 0.189 | ❌ 已超越 |
-| TimeMixer++ (ICLR2025)| 0.171 | ❌ 已超越 |
-| **Swin-iFold ($8 \times 12$)** | **0.1636** | **👑 冠军 (SOTA)** |
+| TimeMixer++ (ICLR2025)| 0.171 | SOTA|
+| **Swin-iFold ($8 \times 12$)** | **0.179** | **👑 亚军 ** |
 
 ---
 
